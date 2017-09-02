@@ -46,6 +46,9 @@
 // #define BACKWARD_SYSTEM_LINUX
 //	- specialization for linux
 //
+// #define BACKWARD_SYSTEM_WINDOWS
+//	- specialization for windows
+//
 // #define BACKWARD_SYSTEM_UNKNOWN
 //	- placebo implementation, does nothing.
 //
@@ -54,6 +57,8 @@
 #else
 #	if defined(__linux)
 #		define BACKWARD_SYSTEM_LINUX
+#   elif defined(_WIN32)
+#		define BACKWARD_SYSTEM_WINDOWS		
 #	else
 #		define BACKWARD_SYSTEM_UNKNOWN
 #	endif
@@ -73,6 +78,16 @@
 #include <string>
 #include <vector>
 #include <limits>
+
+#if defined(BACKWARD_SYSTEM_WINDOWS)
+
+#define NOMINMAX // So we can use std::min
+
+#include <Windows.h>
+#include <Dbghelp.h>
+
+#pragma comment(lib, "Dbghelp.lib")
+#endif // BACKWARD_SYSTEM_WINDOWS
 
 #if defined(BACKWARD_SYSTEM_LINUX)
 
@@ -254,10 +269,13 @@ namespace backward {
 namespace system_tag {
 	struct linux_tag; // seems that I cannot call that "linux" because the name
 	// is already defined... so I am adding _tag everywhere.
+	struct windows_tag;
 	struct unknown_tag;
 
 #if   defined(BACKWARD_SYSTEM_LINUX)
 	typedef linux_tag current_tag;
+#elif defined(BACKWARD_SYSTEM_WINDOWS)
+	typedef windows_tag current_tag;
 #elif defined(BACKWARD_SYSTEM_UNKNOWN)
 	typedef unknown_tag current_tag;
 #else
@@ -502,6 +520,90 @@ public:
 	void skip_n_firsts(size_t) { }
 };
 
+#ifdef BACKWARD_SYSTEM_WINDOWS
+class StackTraceWindowsImplBase
+{
+public:
+	StackTraceWindowsImplBase() : _thread_id(0), _skip(0) {}
+
+	unsigned thread_id() const {
+		return _thread_id;
+	}
+
+	void skip_n_firsts(size_t n) { _skip = n; }
+
+protected:
+
+	size_t skip_n_firsts() const { return _skip; }
+private:
+
+	size_t _thread_id;
+	size_t _skip;
+};
+
+
+class StackTraceWindowsImplHolder : public StackTraceWindowsImplBase {
+public:
+	size_t size() const {
+		return _stacktrace.size() ? _stacktrace.size() - skip_n_firsts() : 0;
+	}
+	Trace operator[](size_t idx) {
+		if (idx >= size()) {
+			return Trace();
+		}
+		return Trace(_stacktrace[idx + skip_n_firsts()], idx);
+	}
+	void** begin() {
+		if (size()) {
+			return &_stacktrace[skip_n_firsts()];
+		}
+		return 0;
+	}
+
+protected:
+	std::vector<void*> _stacktrace;
+};
+
+
+template <>
+class StackTraceImpl<system_tag::windows_tag> : public StackTraceWindowsImplHolder {
+public:
+	__declspec(noinline)
+		size_t load_here(size_t depth = 32) {
+		//load_thread_info();
+		if (depth == 0) {
+			return 0;
+		}
+
+		_stacktrace.resize(depth);
+
+		SymInitialize(GetCurrentProcess(), nullptr, true);
+		auto frames = CaptureStackBackTrace(skip_n_firsts(), depth, _stacktrace.data(), nullptr);
+
+		_stacktrace.resize(frames);
+		skip_n_firsts(0);
+		return size();
+	}
+
+	size_t load_from(void* addr, size_t depth = 32) {
+		load_here(depth + 8);
+
+		for (size_t i = 0; i < _stacktrace.size(); ++i) {
+			if (_stacktrace[i] == addr) {
+				skip_n_firsts(i);
+				break;
+			}
+		}
+
+		_stacktrace.resize(std::min(_stacktrace.size(), skip_n_firsts() + depth));
+		return size();
+
+		return 0;
+	}
+};
+
+#endif // BACKWARD_SYSTEM_WINDOWS
+
 #ifdef BACKWARD_SYSTEM_LINUX
 
 class StackTraceLinuxImplBase {
@@ -713,6 +815,56 @@ public:
 };
 
 #endif
+
+#ifdef BACKWARD_SYSTEM_WINDOWS
+class TraceResolverWindowsImpl
+{
+public:
+	template <class ST>
+	void load_stacktrace(ST& st) {
+		using namespace details;
+		if (st.size() == 0) {
+			return;
+		}
+		
+		// We are allocating the structs for the stack trace, they will be deleted by the detail::handle d'tor
+		
+		auto symbols = (SYMBOL_INFO *)malloc(sizeof(SYMBOL_INFO) + 256 * sizeof(char)); // According to msdn
+		symbols->MaxNameLen = 255; // According to MSDN
+		symbols->SizeOfStruct = sizeof(SYMBOL_INFO);
+
+		auto lines = (IMAGEHLP_LINE *)malloc(sizeof(IMAGEHLP_LINE));
+		lines->SizeOfStruct = sizeof(IMAGEHLP_LINE);
+
+		_symbols.reset(symbols);
+		_lines.reset(lines);
+	}
+
+	ResolvedTrace resolve(ResolvedTrace trace) {
+		if (SymFromAddr(GetCurrentProcess(), (DWORD64)(trace.addr), 0, _symbols.get()))
+		{
+			DWORD displacement;
+			trace.object_function.assign(_symbols.get()->Name, _symbols.get()->Name + _symbols.get()->NameLen);
+#if defined(_WIN64)
+			if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD)trace.addr, &displacement, _lines.get()))
+#else
+			if (SymGetLineFromAddr(GetCurrentProcess(), (DWORD)trace.addr, &displacement, _lines.get()))
+#endif
+			{
+				trace.object_filename.assign(_lines.get()->FileName);
+				trace.source.function = trace.object_function;
+				trace.source.filename = trace.object_filename;
+				trace.source.line = _lines.get()->LineNumber;
+			}
+		}
+		return trace;
+	}
+
+private:
+	details::handle<SYMBOL_INFO*> _symbols;
+	details::handle<IMAGEHLP_LINE*> _lines;
+};
+#endif // BACKWARD_SYSTEM_WINDOWS
 
 #ifdef BACKWARD_SYSTEM_LINUX
 
@@ -1489,6 +1641,12 @@ class TraceResolverImpl<system_tag::linux_tag>:
 	public TraceResolverLinuxImpl<trace_resolver_tag::current> {};
 
 #endif // BACKWARD_SYSTEM_LINUX
+
+#ifdef BACKWARD_SYSTEM_WINDOWS
+template<>
+class TraceResolverImpl<system_tag::windows_tag>:
+	public TraceResolverWindowsImpl {};
+#endif // BACKWARD_SYSTEM_WINDOWS
 
 class TraceResolver:
 	public TraceResolverImpl<system_tag::current_tag> {};
